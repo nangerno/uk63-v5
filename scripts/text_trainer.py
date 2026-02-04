@@ -405,12 +405,10 @@ def main():
 
     original_train_cmd = train_cmd
     train_success = False
-    state = get_state()
+    # Reset state to initial values
     state = {}
-    set_state(state) # reset first
     state["mode"] = "initial"
     # at first the state is always running the train_cmd
-
     set_state(state)
     # TODO Run something magic here
     count = 0
@@ -428,25 +426,42 @@ def main():
                 
             elif state["mode"] == "continue":
                 c_train_info["train_request"]["checking_mode"] = "second_time"
+                if "next_runs" not in state:
+                    print(f"Error: 'next_runs' key not found in state when mode is 'continue'", flush=True)
+                    break
                 n_runs = state["next_runs"]
                 if "lrs" not in state: # first time of continue
+                    if "train" not in state or "lr" not in state["train"]:
+                        print(f"Error: 'train' or 'lr' key not found in state when initializing learning rates", flush=True)
+                        break
                     current_lr = float(state["train"]["lr"])
                     state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
                     assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
                     state["runs"] = []
                 
                 set_state(state)
+                if "runs" not in state:
+                    state["runs"] = []
                 state["runs"].append(state["train"].copy())
                 delete_poor_checkpoints(state["runs"])
                 if len(state["runs"]) < n_runs:
                     index = len(state["runs"])
+                    if "lrs" not in state or index >= len(state["lrs"]):
+                        print(f"Error: 'lrs' key not found or index out of bounds when accessing learning rate", flush=True)
+                        break
                     current_lr = state["lrs"][index]
                     train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
                 else: # the final run
                     # first find from runs the best loss
                     c_train_info["train_request"]["checking_mode"] = "none"
+                    if "runs" not in state or len(state["runs"]) == 0:
+                        print(f"Error: 'runs' key not found or empty when trying to select best run", flush=True)
+                        break
                     index = np.argmin([run["current_loss"] for run in state["runs"]])
-                    print(f"BL;{index};{state['runs'][index]['current_loss']}; {state['lrs'][index]}", flush=True)
+                    if index >= len(state["runs"]) or ("lrs" in state and index >= len(state["lrs"])):
+                        print(f"Error: Index out of bounds when accessing runs or lrs", flush=True)
+                        break
+                    print(f"BL;{index};{state['runs'][index]['current_loss']}; {state['lrs'][index] if 'lrs' in state else 'N/A'}", flush=True)
                     train_cmd = state["runs"][index]["train_cmd"]  #replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
                     final_output_dir = state["runs"][index]["output_dir"]
                     state["mode"] = "finish"

@@ -236,6 +236,15 @@ class CustomEvalSaveCallback(TrainerCallback):
         
         if state.global_step == self.checking_step and self.checking_mode == "first_time":
             my_state = get_state()
+            if "train" not in my_state:
+                print(f"Warning: 'train' key not found in state at step {state.global_step}", flush=True)
+                return control
+            if "start_time" not in my_state["train"]:
+                print(f"Warning: 'start_time' key not found in state['train'] at step {state.global_step}", flush=True)
+                return control
+            if "start_train_time" not in my_state["train"]:
+                print(f"Warning: 'start_train_time' key not found in state['train'] at step {state.global_step}", flush=True)
+                return control
             start_time_obj = datetime.datetime.strptime(my_state["train"]["start_time"], "%Y-%m-%d %H:%M:%S")
             start_train_time_obj = datetime.datetime.strptime(my_state["train"]["start_train_time"], "%Y-%m-%d %H:%M:%S")
             
@@ -295,12 +304,18 @@ class CustomEvalSaveCallback(TrainerCallback):
         elif state.global_step == self.checking_step and self.checking_mode == "second_time":
             log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
             my_state = get_state()
+            if "train" not in my_state:
+                print(f"Warning: 'train' key not found in state at step {state.global_step}", flush=True)
+                return control
             current_loss = state.log_history[-1]["loss"]
             my_state["train"]["current_loss"] = current_loss
                 
             control.should_training_stop = True
 
             current_is_the_best = False
+            if "runs" not in my_state or len(my_state["runs"]) == 0:
+                print(f"Warning: 'runs' key not found or empty in state at step {state.global_step}", flush=True)
+                return control
             current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
             if current_loss <= current_min_loss:
                 if len(my_state["runs"]) + 1 == my_state["next_runs"]:
