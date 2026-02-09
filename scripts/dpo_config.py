@@ -164,8 +164,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --tf32 True \
     --gradient_checkpointing {gradient_checkpointing} \
     --optim {optimizer} \
-    --use_liger {use_liger} --disable_fa {disable_fa} \
-    --max_grad_norm 1.0"""
+    --use_liger {use_liger} --disable_fa {disable_fa}"""
     )
 
     if config.get("use_lora", False):
@@ -235,7 +234,8 @@ def get_training_json(train_info: dict) -> dict:
     train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
-    train_request["checking_step"] = 80
+    train_request["checking_step"] = 80  # Default, will be overridden by two-phase strategy if enabled
+    train_request["skip_evaluation"] = False  # Default, Phase 1 will set to True
     
     return {
         "train_request": train_request,

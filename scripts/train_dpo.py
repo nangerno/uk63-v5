@@ -309,7 +309,8 @@ def main():
                 checking_step=checking_step,
                 total_steps_all_epochs=total_steps_all_epochs,
                 end_time=train_request["end_time"],
-                checking_mode=train_request.get("checking_mode", "none")
+                checking_mode=train_request.get("checking_mode", "none"),
+                skip_evaluation=train_request.get("skip_evaluation", False)
             )
         ],
     )

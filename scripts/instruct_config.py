@@ -170,7 +170,6 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --use_liger {use_liger} \
     --packing {packing} --disable_fa {disable_fa}"""
     )
-    
     if run_type == "ds":
         template = template + """ --deepspeed ds_config/zero3.json"""
 
@@ -185,10 +184,6 @@ def get_run_cmd(config: dict, gpu_nums: int):
         template = (
             template + f""" --use_attn_implementation {use_attn_implementation}"""
         )
-    
-    # Add label smoothing if specified
-    if config.get("label_smoothing_factor", 0) > 0:
-        template += f" --label_smoothing_factor {config['label_smoothing_factor']}"
 
     return template
 
@@ -215,7 +210,6 @@ def get_training_json(train_info: dict) -> dict:
         "distributed": config.get("distributed", "ddp"),
         "gradient_checkpointing": "True",
         "gradient_accumulation_steps": 4,
-        "label_smoothing_factor": 0.1,  # Add label smoothing for better generalization
         "use_attn_implementation": (
             "kernels-community/vllm-flash-attn3"
             if train_info.get("is_openai", False)
@@ -285,7 +279,8 @@ def get_training_json(train_info: dict) -> dict:
     train_request["save_before_remaining_time"] = 3
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
-    train_request["checking_step"] = 70
+    train_request["checking_step"] = 70  # Default, will be overridden by two-phase strategy if enabled
+    train_request["skip_evaluation"] = False  # Default, Phase 1 will set to True
 
     if param_nums < 1_000_000_000:
         train_request["min_steps"] = max(

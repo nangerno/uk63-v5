@@ -44,6 +44,7 @@ from grpo_config import get_training_json as get_grpo_training_json
 import pathlib
 from transformers import AutoConfig
 import lr_utils
+from two_phase_trainer import TwoPhaseTrainingStrategy, extract_value_from_cmd, replace_args_in_cmd
 
 def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
     # print(f"Running command: {cmd}", flush=True)
@@ -405,107 +406,276 @@ def main():
 
     original_train_cmd = train_cmd
     train_success = False
-    # Reset state to initial values
-    state = {}
-    state["mode"] = "initial"
-    # at first the state is always running the train_cmd
-    set_state(state)
-    # TODO Run something magic here
-    count = 0
-    while True:
-        state = get_state()
-        train_cmd = original_train_cmd  # will replace based on the state later
-        c_train_info = copy.deepcopy(train_info)
-        final_output_dir = None
-        if args.task_type == TaskType.GRPOTASK.value:
-            state["mode"] = "finish" # do not run this for GRPO task
-            c_train_info["train_request"]["checking_mode"] = "none"
-        else:
-            if state["mode"] == "initial":
-                c_train_info["train_request"]["checking_mode"] = "first_time"
-                
-            elif state["mode"] == "continue":
-                c_train_info["train_request"]["checking_mode"] = "second_time"
-                if "next_runs" not in state:
-                    print(f"Error: 'next_runs' key not found in state when mode is 'continue'", flush=True)
-                    break
-                n_runs = state["next_runs"]
-                if "lrs" not in state: # first time of continue
-                    if "train" not in state or "lr" not in state["train"]:
-                        print(f"Error: 'train' or 'lr' key not found in state when initializing learning rates", flush=True)
-                        break
-                    current_lr = float(state["train"]["lr"])
-                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
-                    assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
-                    state["runs"] = []
-                
-                set_state(state)
-                if "runs" not in state:
-                    state["runs"] = []
-                state["runs"].append(state["train"].copy())
-                delete_poor_checkpoints(state["runs"])
-                if len(state["runs"]) < n_runs:
-                    index = len(state["runs"])
-                    if "lrs" not in state or index >= len(state["lrs"]):
-                        print(f"Error: 'lrs' key not found or index out of bounds when accessing learning rate", flush=True)
-                        break
-                    current_lr = state["lrs"][index]
-                    train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                else: # the final run
-                    # first find from runs the best loss
-                    c_train_info["train_request"]["checking_mode"] = "none"
-                    if "runs" not in state or len(state["runs"]) == 0:
-                        print(f"Error: 'runs' key not found or empty when trying to select best run", flush=True)
-                        break
-                    index = np.argmin([run["current_loss"] for run in state["runs"]])
-                    if index >= len(state["runs"]) or ("lrs" in state and index >= len(state["lrs"])):
-                        print(f"Error: Index out of bounds when accessing runs or lrs", flush=True)
-                        break
-                    print(f"BL;{index};{state['runs'][index]['current_loss']}; {state['lrs'][index] if 'lrs' in state else 'N/A'}", flush=True)
-                    train_cmd = state["runs"][index]["train_cmd"]  #replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                    final_output_dir = state["runs"][index]["output_dir"]
-                    state["mode"] = "finish"
-            else: # the state = finish; no need to run more
-                assert state["mode"] == "finish"
-                break
+    
+    # Initialize Two-Phase Training Strategy
+    two_phase_strategy = TwoPhaseTrainingStrategy(args.hours_to_complete, args.task_type)
+    
+    # Skip two-phase for GRPO tasks (they have different evaluation)
+    use_two_phase = args.task_type != TaskType.GRPOTASK.value
+    
+    if use_two_phase:
+        print("=" * 80, flush=True)
+        print("TWO-PHASE TRAINING STRATEGY ENABLED", flush=True)
+        print("Phase 1: Fast convergence (55% time) - Aggressive settings, early checkpoint", flush=True)
+        print("Phase 2: Quality refinement (45% time) - Conservative settings, fine-tune from Phase 1", flush=True)
+        print("=" * 80, flush=True)
         
+        # Phase 1: Fast Convergence
+        print("\n>>> STARTING PHASE 1: FAST CONVERGENCE", flush=True)
+        phase1_start_time = datetime.now(timezone.utc)
+        phase1_end_time_str = two_phase_strategy.get_phase_end_time(phase1_start_time, "phase1")
+        
+        # Extract config from train_info for Phase 1
+        # train_info has train_request dict, we need to work with that
+        phase1_train_info = copy.deepcopy(train_info)
+        phase1_train_request = phase1_train_info.get("train_request", {})
+        
+        # Extract learning rate from command - store for Phase 2
+        base_lr_str = extract_value_from_cmd(original_train_cmd, "learning_rate")
+        if base_lr_str:
+            base_lr = float(base_lr_str)
+        else:
+            base_lr = 4e-5  # Default fallback
+        
+        # Extract batch size from command - store for Phase 2
+        base_batch_size_str = extract_value_from_cmd(original_train_cmd, "per_device_train_batch_size")
+        base_batch_size = int(base_batch_size_str) if base_batch_size_str else None
+        
+        # Extract gradient accumulation - store for Phase 2
+        base_grad_accum_str = extract_value_from_cmd(original_train_cmd, "gradient_accumulation_steps")
+        base_grad_accum = int(base_grad_accum_str) if base_grad_accum_str else None
+        
+        # Create Phase 1 config dict for command modification
+        phase1_config = {
+            "learning_rate": base_lr * 1.5,  # Aggressive LR
+            "warmup_steps": max(10, int(phase1_train_request.get("warmup_steps", 35) * 0.6)),
+        }
+        
+        # Add batch size if extracted
+        if base_batch_size:
+            phase1_config["batch_size"] = int(base_batch_size * 1.2)
+        
+        # Add gradient accumulation if extracted
+        if base_grad_accum:
+            phase1_config["gradient_accumulation_steps"] = base_grad_accum
+        
+        phase1_output_dir = os.path.join(output_dir, "phase1")
+        os.makedirs(phase1_output_dir, exist_ok=True)
+        
+        # Modify train command for Phase 1
+        phase1_train_cmd = two_phase_strategy.modify_train_cmd_for_phase(
+            original_train_cmd, phase1_config, phase1_output_dir, request_path
+        )
+        
+        # Update train_request for Phase 1
+        phase1_train_request["end_time"] = phase1_end_time_str
+        phase1_train_request["checking_mode"] = "first_time"
+        phase1_train_request["skip_evaluation"] = True  # Skip eval to save time
+        
+        # Calculate early checking step (30-50 steps vs competitor's 100)
+        # Estimate total steps - use checking_step as reference or default
+        default_checking = phase1_train_request.get("checking_step", 70)
+        estimated_total_steps = max(1000, default_checking * 20)  # Rough estimate
+        early_checking_step = two_phase_strategy.get_early_checking_step(estimated_total_steps, "phase1")
+        phase1_train_request["checking_step"] = early_checking_step
+        print(f"Phase 1 checking step: {early_checking_step} (vs competitor's 100)", flush=True)
+        
+        phase1_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_phase1.json")
+        with open(phase1_request_path, "w") as f:
+            json.dump(phase1_train_info, f, indent=4, ensure_ascii=False)
+        
+        phase1_train_cmd = replace_args_in_cmd(phase1_train_cmd, "request_path", phase1_request_path)
+        
+        # Run Phase 1 training
+        phase1_log_path = os.path.join(ds_folder, f"train_{args.task_id}_phase1.log")
+        phase1_success = run_training(
+            phase1_train_cmd,
+            phase1_log_path,
+            args.task_id,
+            args.retries,
+            args.task_type,
+            args.expected_repo_name,
+        )
+        
+        if not phase1_success:
+            print("Phase 1 training failed, falling back to standard training", flush=True)
+            use_two_phase = False
+        else:
+            # Find Phase 1 checkpoint
+            phase1_checkpoint = None
+            if os.path.exists(phase1_output_dir):
+                # Look for latest checkpoint
+                try:
+                    checkpoints = [d for d in os.listdir(phase1_output_dir) if d.startswith("checkpoint-")]
+                    if checkpoints:
+                        # Get checkpoint with highest step number
+                        checkpoint_steps = []
+                        for c in checkpoints:
+                            try:
+                                step_num = int(c.split("-")[1])
+                                checkpoint_steps.append((step_num, c))
+                            except (ValueError, IndexError):
+                                continue
+                        
+                        if checkpoint_steps:
+                            latest_step, latest_checkpoint = max(checkpoint_steps, key=lambda x: x[0])
+                            phase1_checkpoint = os.path.join(phase1_output_dir, latest_checkpoint)
+                            print(f"Phase 1 checkpoint found: {phase1_checkpoint} (step {latest_step})", flush=True)
+                        else:
+                            # Use output_dir as checkpoint if parsing failed
+                            phase1_checkpoint = phase1_output_dir
+                            print(f"Using Phase 1 output_dir as checkpoint: {phase1_checkpoint}", flush=True)
+                    else:
+                        # Check if success.txt exists (training completed)
+                        if os.path.exists(os.path.join(phase1_output_dir, "success.txt")):
+                            phase1_checkpoint = phase1_output_dir
+                            print(f"Phase 1 completed, using output_dir as checkpoint: {phase1_checkpoint}", flush=True)
+                        else:
+                            print(f"No checkpoints found in {phase1_output_dir}", flush=True)
+                except Exception as e:
+                    print(f"Error finding Phase 1 checkpoint: {e}", flush=True)
+                    # Try using output_dir as fallback
+                    if os.path.exists(phase1_output_dir):
+                        phase1_checkpoint = phase1_output_dir
+            
+            if phase1_checkpoint and os.path.exists(phase1_checkpoint):
+                # Phase 2: Quality Refinement
+                print("\n>>> STARTING PHASE 2: QUALITY REFINEMENT", flush=True)
+                phase2_start_time = datetime.now(timezone.utc)
+                phase2_end_time_str = two_phase_strategy.get_phase_end_time(phase2_start_time, "phase2")
+                
+                # Create Phase 2 config - conservative settings
+                phase2_train_info = copy.deepcopy(train_info)
+                phase2_train_request = phase2_train_info.get("train_request", {})
+                
+                # Phase 2 config - conservative settings
+                phase2_config = {
+                    "learning_rate": base_lr * 0.5,  # Conservative LR (half of base)
+                    "warmup_steps": int(phase2_train_request.get("warmup_steps", 35) * 1.5),
+                    "resume_from_checkpoint": phase1_checkpoint,
+                }
+                
+                # Smaller batch size for Phase 2
+                if base_batch_size:
+                    phase2_config["batch_size"] = max(2, int(base_batch_size * 0.8))
+                
+                # Adjust gradient accumulation
+                if base_grad_accum:
+                    phase2_config["gradient_accumulation_steps"] = base_grad_accum
+                
+                phase2_output_dir = submission_dir  # Final output goes to submission_dir
+                os.makedirs(phase2_output_dir, exist_ok=True)
+                
+                # Modify train command for Phase 2
+                phase2_train_cmd = two_phase_strategy.modify_train_cmd_for_phase(
+                    original_train_cmd, phase2_config, phase2_output_dir, request_path
+                )
+                
+                # Update train_request for Phase 2
+                phase2_train_request["end_time"] = phase2_end_time_str
+                phase2_train_request["checking_mode"] = "none"  # No early stopping in Phase 2
+                phase2_train_request["skip_evaluation"] = False  # Full evaluation in Phase 2
+                
+                # Calculate checking step for Phase 2 (still earlier than 100)
+                phase2_checking_step = two_phase_strategy.get_early_checking_step(estimated_total_steps, "phase2")
+                phase2_train_request["checking_step"] = phase2_checking_step
+                print(f"Phase 2 checking step: {phase2_checking_step}", flush=True)
+                
+                phase2_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_phase2.json")
+                with open(phase2_request_path, "w") as f:
+                    json.dump(phase2_train_info, f, indent=4, ensure_ascii=False)
+                
+                phase2_train_cmd = replace_args_in_cmd(phase2_train_cmd, "request_path", phase2_request_path)
+                
+                # Run Phase 2 training
+                phase2_log_path = os.path.join(ds_folder, f"train_{args.task_id}_phase2.log")
+                train_success = run_training(
+                    phase2_train_cmd,
+                    phase2_log_path,
+                    args.task_id,
+                    args.retries,
+                    args.task_type,
+                    args.expected_repo_name,
+                )
+            else:
+                print("Phase 1 checkpoint not found, falling back to standard training", flush=True)
+                use_two_phase = False
+    
+    # Fallback to original logic if two-phase failed or GRPO task
+    if not use_two_phase:
+        print("Using standard training strategy", flush=True)
+        state = get_state()
+        state = {}
+        set_state(state) # reset first
+        state["mode"] = "initial"
         set_state(state)
-        if train_cmd:
-            run_output_dir = output_dir + f"_{count}" if not final_output_dir else final_output_dir
-            train_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
+        
+        count = 0
+        while True:
+            state = get_state()
+            train_cmd = original_train_cmd
+            c_train_info = copy.deepcopy(train_info)
+            final_output_dir = None
             
-            current_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_{count}.json")
-            with open(current_request_path, "w") as f:
-                json.dump(c_train_info, f, indent=4, ensure_ascii=False)
-            
-            train_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
-            
-            state["train"] = {
-                "train_cmd": train_cmd,
-                "log_path": os.path.join(ds_folder, f"train_{args.task_id}.log"),
-                "lr": extract_value_from_cmd(train_cmd, "learning_rate"),
-                "output_dir": run_output_dir
-            }
-            state["train"]["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if args.task_type == TaskType.GRPOTASK.value:
+                state["mode"] = "finish"
+                c_train_info["train_request"]["checking_mode"] = "none"
+            else:
+                if state["mode"] == "initial":
+                    c_train_info["train_request"]["checking_mode"] = "first_time"
+                elif state["mode"] == "continue":
+                    c_train_info["train_request"]["checking_mode"] = "second_time"
+                    n_runs = state["next_runs"]
+                    if "lrs" not in state:
+                        current_lr = float(state["train"]["lr"])
+                        state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
+                        assert len(state["lrs"]) == n_runs
+                        state["runs"] = []
+                    set_state(state)
+                    state["runs"].append(state["train"].copy())
+                    delete_poor_checkpoints(state["runs"])
+                    if len(state["runs"]) < n_runs:
+                        index = len(state["runs"])
+                        train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
+                    else:
+                        c_train_info["train_request"]["checking_mode"] = "none"
+                        index = np.argmin([run["current_loss"] for run in state["runs"]])
+                        print(f"BL;{index};{state['runs'][index]['current_loss']}; {state['lrs'][index]}", flush=True)
+                        train_cmd = state["runs"][index]["train_cmd"]
+                        final_output_dir = state["runs"][index]["output_dir"]
+                        state["mode"] = "finish"
+                else:
+                    assert state["mode"] == "finish"
+                    break
             
             set_state(state)
-            
-            log_path = state["train"]["log_path"]
-            # print(f"Run training with train_info: {c_train_info}", flush=True)
-            success = run_training(
-                train_cmd,
-                log_path,
-                args.task_id,
-                args.retries,
-                args.task_type,
-                args.expected_repo_name,
-            )
-            time.sleep(5)
-            if not success:
-                print(f"Training failed for task {args.task_id} at count={count}", flush=True)
-                break 
-        
-        count += 1
+            if train_cmd:
+                run_output_dir = output_dir + f"_{count}" if not final_output_dir else final_output_dir
+                train_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
+                current_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_{count}.json")
+                with open(current_request_path, "w") as f:
+                    json.dump(c_train_info, f, indent=4, ensure_ascii=False)
+                train_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
+                
+                state["train"] = {
+                    "train_cmd": train_cmd,
+                    "log_path": os.path.join(ds_folder, f"train_{args.task_id}.log"),
+                    "lr": extract_value_from_cmd(train_cmd, "learning_rate"),
+                    "output_dir": run_output_dir
+                }
+                state["train"]["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                set_state(state)
+                
+                log_path = state["train"]["log_path"]
+                success = run_training(
+                    train_cmd, log_path, args.task_id, args.retries, args.task_type, args.expected_repo_name,
+                )
+                time.sleep(5)
+                if not success:
+                    print(f"Training failed for task {args.task_id} at count={count}", flush=True)
+                    break
+                train_success = success
+            count += 1
 
     if not os.path.exists(submission_dir) or len(os.listdir(submission_dir)) < 2:
         print(f"Training failed for task {args.task_id}", flush=True)

@@ -13,9 +13,7 @@ import json
 from transformers.trainer_utils import is_main_process
 import wandb
 import torch
-import torch.nn as nn
 from state_manager import get_state, set_state
-import numpy as np
 MAX_TRIES = 9
 
 
@@ -36,117 +34,7 @@ ERROR_GENERATION_CONFIG_MODELS = [
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 print(f"LOCAL_RANK: {LOCAL_RANK} in customized_trainer.py", flush=True)
-
-
-class EMA:
-    """Exponential Moving Average for model weights"""
-    def __init__(self, model, decay=0.9999):
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        self.register()
-
-    def register(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name]
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data = self.backup[name]
-        self.backup = {}
-
-
-class SWA:
-    """Stochastic Weight Averaging"""
-    def __init__(self, model, start_step=0, swa_freq=1):
-        self.model = model
-        self.start_step = start_step
-        self.swa_freq = swa_freq
-        self.swa_model = {}
-        self.swa_n = 0
-        self.enabled = False
-
-    def update(self, step):
-        if step >= self.start_step and step % self.swa_freq == 0:
-            self.enabled = True
-            for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    if name not in self.swa_model:
-                        self.swa_model[name] = param.data.clone()
-                    else:
-                        self.swa_model[name] = (self.swa_n * self.swa_model[name] + param.data) / (self.swa_n + 1)
-            self.swa_n += 1
-
-    def apply_swa(self):
-        if not self.enabled or self.swa_n == 0:
-            return False
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.swa_model:
-                param.data = self.swa_model[name].clone()
-        return True
-
-
-class AdvancedCheckpointSelector:
-    """Multi-criteria checkpoint selection"""
-    def __init__(self):
-        self.checkpoints = []
-        
-    def add_checkpoint(self, step, eval_loss, train_loss, gradient_norm=None):
-        score = self._calculate_score(eval_loss, train_loss, gradient_norm)
-        self.checkpoints.append({
-            'step': step,
-            'eval_loss': eval_loss,
-            'train_loss': train_loss,
-            'gradient_norm': gradient_norm,
-            'score': score
-        })
-        
-    def _calculate_score(self, eval_loss, train_loss, gradient_norm):
-        """Calculate composite score - lower is better"""
-        if eval_loss is None or train_loss is None:
-            return float('inf')
-        
-        # Base score: eval loss (most important)
-        score = eval_loss
-        
-        # Penalty for overfitting (large train/eval gap)
-        if train_loss > 0:
-            overfit_ratio = eval_loss / train_loss if train_loss > 0 else 1.0
-            if overfit_ratio > 1.5:  # Significant overfitting
-                score *= 1.1
-        
-        # Bonus for stable gradients
-        if gradient_norm is not None:
-            if 0.1 < gradient_norm < 10.0:  # Reasonable gradient norm
-                score *= 0.98
-        
-        return score
     
-    def get_best_checkpoint(self):
-        if not self.checkpoints:
-            return None
-        best = min(self.checkpoints, key=lambda x: x['score'])
-        return best
-    
-    def get_all_checkpoints(self):
-        return sorted(self.checkpoints, key=lambda x: x['score'])
-
-
 class CustomEvalSaveCallback(TrainerCallback):
     def __init__(
         self,
@@ -159,10 +47,7 @@ class CustomEvalSaveCallback(TrainerCallback):
         total_steps_all_epochs: int = -1,
         end_time: str = "",
         checking_mode: str = "none",
-        use_ema: bool = True,
-        use_swa: bool = True,
-        ema_decay: float = 0.9999,
-        swa_start_ratio: float = 0.75,
+        skip_evaluation: bool = False
     ):
         self.function_when_to_evaluate = function_when_to_evaluate
         self.submission_dir = submission_dir
@@ -178,73 +63,28 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.total_steps_all_epochs = total_steps_all_epochs
         self.checking_mode = checking_mode
         self.end_time = end_time
-        self.use_ema = use_ema
-        self.use_swa = use_swa
-        self.ema = None
-        self.swa = None
-        self.checkpoint_selector = AdvancedCheckpointSelector()
-        self.ema_decay = ema_decay
-        self.swa_start_ratio = swa_start_ratio
-        self.loss_history = []
-        self.gradient_norms = []
+        self.skip_evaluation = skip_evaluation
         
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
 
-    def on_train_begin(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
-        """Initialize EMA and SWA"""
-        if model is not None and is_main_process(LOCAL_RANK):
-            if self.use_ema:
-                self.ema = EMA(model, decay=self.ema_decay)
-                print(f"EMA initialized with decay={self.ema_decay}", flush=True)
-            if self.use_swa:
-                swa_start_step = int(self.total_steps_all_epochs * self.swa_start_ratio) if self.total_steps_all_epochs > 0 else 0
-                self.swa = SWA(model, start_step=swa_start_step, swa_freq=1)
-                print(f"SWA initialized starting at step {swa_start_step}", flush=True)
-
-    def on_step_end(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
-        """Update EMA and SWA, track metrics"""
-        if model is not None and is_main_process(LOCAL_RANK):
-            if self.ema is not None:
-                self.ema.update()
-            if self.swa is not None:
-                self.swa.update(state.global_step)
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        # Custom logic to decide whether to save or evaluate
+        # print(f"************* on_step_end: {state.global_step}, check eval", flush=True)
+        # TODO: implement the logic to save the model without evaluating if there is no check points --> avoid evaluating takes too much time
+        # Check if the checking_step is reached
+        # print(f"Checking the model at step: {state.global_step}, checking_step: {self.checking_step}, checking_mode: {self.checking_mode}", flush=True)
         
-        # Track loss history for better selection
-        if state.log_history:
-            last_log = state.log_history[-1]
-            if "loss" in last_log:
-                self.loss_history.append(last_log["loss"])
-                # Keep only last 100 losses for trend analysis
-                if len(self.loss_history) > 100:
-                    self.loss_history.pop(0)
-        
-        # Track gradient norms if available
-        if model is not None:
-            try:
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** (1. / 2)
-                self.gradient_norms.append(total_norm)
-                if len(self.gradient_norms) > 100:
-                    self.gradient_norms.pop(0)
-            except:
-                pass
+        # Two-Phase Training: Skip evaluation in Phase 1 to save time
+        skip_eval = getattr(self, 'skip_evaluation', False)
+        if skip_eval and state.global_step < self.checking_step * 2:
+            # Skip evaluation during early training in Phase 1
+            control.should_evaluate = False
         
         if state.global_step == self.checking_step and self.checking_mode == "first_time":
+            # print(f"Checking the model at step: {state.global_step}", flush=True)
+            # check the time so far to estimate the training time in total 
             my_state = get_state()
-            if "train" not in my_state:
-                print(f"Warning: 'train' key not found in state at step {state.global_step}", flush=True)
-                return control
-            if "start_time" not in my_state["train"]:
-                print(f"Warning: 'start_time' key not found in state['train'] at step {state.global_step}", flush=True)
-                return control
-            if "start_train_time" not in my_state["train"]:
-                print(f"Warning: 'start_train_time' key not found in state['train'] at step {state.global_step}", flush=True)
-                return control
             start_time_obj = datetime.datetime.strptime(my_state["train"]["start_time"], "%Y-%m-%d %H:%M:%S")
             start_train_time_obj = datetime.datetime.strptime(my_state["train"]["start_train_time"], "%Y-%m-%d %H:%M:%S")
             
@@ -256,15 +96,20 @@ class CustomEvalSaveCallback(TrainerCallback):
             log_content += f"\nTime so far: {time_so_far}"
             time_for_one_step = (now - start_train_time_obj).total_seconds() / self.checking_step
             log_content += f"\nTime for one step: {time_for_one_step}"
+            # Now estimate the total training time for this training
             log_content += f"\nTotal steps all epochs: {self.total_steps_all_epochs}"
             total_remaining_training_time = time_for_one_step * (self.total_steps_all_epochs - state.global_step)
             log_content += f"\nTotal remaining training time: {total_remaining_training_time}"
+            # n * time_so_far + total_remaining_training_time = total_remaining_time
             end_time_obj = datetime.datetime.strptime(self.end_time, "%Y-%m-%d %H:%M:%S")
             total_remaining_time = (end_time_obj - now).total_seconds()
             log_content += f"\nTotal remaining time: {total_remaining_time}"
             
+            # n * time_so_far + (time_so_far + total_remaining_training_time) = total_remaining_time
+            # time_so_far + total_remaining_training_time is the time it takes to finish the training (need to estimate the eval time and save time, assuming this is 15 minutes)
+            # assuming time_so_far is + 5 minutes, just in case the checking step takes more time than expected
             max_var_time_sofar = 3 * 60
-            n = (total_remaining_time - (time_so_far + total_remaining_training_time + 12 * 60)) / (time_so_far + max_var_time_sofar)
+            n = (total_remaining_time - (time_so_far + total_remaining_training_time + 12 * 60)) / (time_so_far + max_var_time_sofar) # 300 = 5 minutes, assume that it extra time would be more or less 5 minutes
             n = int(n)
             my_state["check_details"] = {
                 "now": str(now.strftime("%Y-%m-%d %H:%M:%S")),
@@ -280,18 +125,19 @@ class CustomEvalSaveCallback(TrainerCallback):
                 "total_remaining_time": total_remaining_time,
                 "end_time": self.end_time,
             }
-            if n > 0:
+            if n > 0: # we should try more 
                 log_content += f"\nEstimated number of steps to complete the training: {n}"
                 control.should_training_stop = True
                 control.should_save = False
                 args.save_strategy = "no"
+                # save the current loss of this step to the state;
                 last_log = state.log_history[-1]
                 my_state["train"]["current_loss"] = last_log["loss"]
                 my_state["mode"] = "continue"
                 if n > MAX_TRIES:
                     n = MAX_TRIES
                 log_content += f"\nFinal number: {n + 1}"
-                my_state["next_runs"] = n + 1
+                my_state["next_runs"] = n + 1 # including the current run
             else:
                 print(f"Time is not enough so we will finish the training", flush=True)
                 my_state["mode"] = "finish"
@@ -301,25 +147,25 @@ class CustomEvalSaveCallback(TrainerCallback):
                 print(log_content, flush=True)            
             return control
     
-        elif state.global_step == self.checking_step and self.checking_mode == "second_time":
+        elif state.global_step == self.checking_step and self.checking_mode == "second_time": # at second time, we don't estimate the training time again, just save the current_loss
             log_content = f"Checking the model at step: {state.global_step} where check_mode=second_time"            
             my_state = get_state()
-            if "train" not in my_state:
-                print(f"Warning: 'train' key not found in state at step {state.global_step}", flush=True)
-                return control
             current_loss = state.log_history[-1]["loss"]
             my_state["train"]["current_loss"] = current_loss
                 
             control.should_training_stop = True
 
+            # Check if current_loss > current min_loss --> do not save to save time and space
+            # 
+            # if my_state["train"]["current_loss"] > current_min_loss:
+            #     print(f"Current loss: {my_state['train']['current_loss']} is greater than the current min_loss: {current_min_loss}, do not save the checkpoint", flush=True)
+            #     control.should_save = False
+            # check if this is the last run and the current_loss is the lowest --> keep running the training
             current_is_the_best = False
-            if "runs" not in my_state or len(my_state["runs"]) == 0:
-                print(f"Warning: 'runs' key not found or empty in state at step {state.global_step}", flush=True)
-                return control
             current_min_loss = min([run["current_loss"] for run in my_state["runs"]])
             if current_loss <= current_min_loss:
                 if len(my_state["runs"]) + 1 == my_state["next_runs"]:
-                    print(f"Current loss: {my_state['train']['current_loss']} is less than or equal to: {current_min_loss}", flush=True)
+                    print(f"Current loss: {my_state['train']['current_loss']} is greater than: {current_min_loss}", flush=True)
                     current_is_the_best = True
                     
             if current_is_the_best:
@@ -331,78 +177,60 @@ class CustomEvalSaveCallback(TrainerCallback):
             
             if is_main_process(LOCAL_RANK):
                 set_state(my_state)
+                # print(log_content, flush=True)
         
+            
         when_to_eval = self.function_when_to_evaluate(state.global_step)
         if when_to_eval["eval"]:
+            # do not allow the pod to be stopped by any reason 
+                # first check if there is at least one checkpoint or not 
             print(f"Evaluating the model at step: {state.global_step} the reason: {when_to_eval['reason']}", flush=True)
             control.should_evaluate = True
             control.should_save = True
             if when_to_eval["reason"] == "end_time":
-                if not self.has_checkpoint:
+                if not self.has_checkpoint: # if there is no checkpoint, we just save the model, do not evaluate
                     print(f"No checkpoint found, just save the model at step: {state.global_step}", flush=True)
                     control.should_evaluate = False
                     self.save_only = True
         return control
 
+
     def on_evaluate(
         self, args, state: TrainerState, control: TrainerControl, metrics, **kwargs
     ):
         self.save_only = False
+        # Append eval_loss to file
         eval_loss = self.compute_loss(state, metrics)
         if state.global_step < 2:
             return 
         print(f"GO INTO CUSTOMIZED EVALUATE AT STEP: {state.global_step}", flush=True)
-        
-        # Get training loss
-        train_loss = None
-        if state.log_history:
-            last_log = state.log_history[-1]
-            train_loss = last_log.get("loss", None)
-        
-        # Get gradient norm
-        gradient_norm = None
-        if self.gradient_norms:
-            gradient_norm = np.mean(self.gradient_norms[-10:])  # Average of last 10
-        
-        # Add to checkpoint selector
-        self.checkpoint_selector.add_checkpoint(
-            state.global_step, 
-            eval_loss, 
-            train_loss, 
-            gradient_norm
-        )
-        
-        # Get best checkpoint from selector
-        best_checkpoint = self.checkpoint_selector.get_best_checkpoint()
-        
-        if best_checkpoint and (self.best_checkpoint_info is None or 
-                               best_checkpoint['step'] == state.global_step):
-            print(f"Updating the best checkpoint info at step: {state.global_step} with eval_loss: {eval_loss}, score: {best_checkpoint['score']:.6f}", flush=True)
+        if self.best_checkpoint_info is None or eval_loss < self.best_checkpoint_info["loss"]:
+            print(f"Updating the best checkpoint info at step: {state.global_step} with eval_loss: {eval_loss}", flush=True)
             self.best_checkpoint_info = {
                 "loss": eval_loss,
-                "step": state.global_step,
-                "score": best_checkpoint['score'],
-                "train_loss": train_loss,
-                "gradient_norm": gradient_norm
+                "step": state.global_step
             }
             self.update_best_checkpoint = True
         else:
             if self.best_checkpoint_info is not None:
-                print(f"At step: {state.global_step} The eval_loss: {eval_loss} score: {best_checkpoint['score'] if best_checkpoint else 'N/A'} is not better than current best: {self.best_checkpoint_info.get('score', self.best_checkpoint_info['loss'])}, update_best_checkpoint={self.update_best_checkpoint}", flush=True)
+                print(f" At step: {state.global_step} The eval_loss: {eval_loss} is not smaller than the current best eval_loss: {self.best_checkpoint_info['loss']}, update_best_checkpoint={self.update_best_checkpoint}", flush=True)
+            
 
-    def on_save(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
+    def on_save(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        
         if state.global_step == self.max_steps and self.max_steps != -1:
             print(f"Stop training because of max steps: {self.max_steps}", flush=True)
             control.should_training_stop = True
         
         self.has_checkpoint = True
         
-        if not is_main_process(LOCAL_RANK):
+        if not is_main_process(LOCAL_RANK): # if not main process, skip this
             return 
             
-        if self.save_only:
+        if self.save_only: # if only save, do not evaluate 
             print(f"Only save the model at step: {state.global_step}, no evaluation", flush=True)
             current_step = state.global_step
+            # Remove existing directory if it exists
             if os.path.exists(self.submission_dir):
                 shutil.rmtree(self.submission_dir)
                 
@@ -411,92 +239,33 @@ class CustomEvalSaveCallback(TrainerCallback):
                 self.submission_dir
             )
             self.update_best_checkpoint = False
+            # add a loss.txt file to the submission directory
             with open(os.path.join(self.submission_dir, "loss.txt"), "w") as f:
                 f.write(f"{current_step},no_eval")
+            
+            # release the flag
             self.save_only = False
             return 
             
+        # Custom logic after model is saved
+        # You can trigger external services, logs, or backups here
         if (
             self.update_best_checkpoint
             and is_main_process(LOCAL_RANK)
         ):
             print(f"Copy the best checkpoint to the submission directory at step: {state.global_step}", flush=True)
+            # Remove existing directory if it exists
             if os.path.exists(self.submission_dir):
                 shutil.rmtree(self.submission_dir)
             best_eval_loss = self.best_checkpoint_info["loss"]
-            best_step = self.best_checkpoint_info["step"]
-            
-            # Use best checkpoint (EMA/SWA will be applied at final save if needed)
-            best_model_path = os.path.join(self.output_dir, f"checkpoint-{best_step}")
-            model_type = "checkpoint"
-            
-            # If we have EMA/SWA and this is near the end, try to use them
-            if model is not None and state.global_step >= self.total_steps_all_epochs * 0.9:
-                # Try SWA first (more stable for final model)
-                if self.swa is not None and self.swa.enabled:
-                    try:
-                        # Save current weights
-                        current_weights = {}
-                        for name, param in model.named_parameters():
-                            if param.requires_grad:
-                                current_weights[name] = param.data.clone()
-                        
-                        # Apply SWA
-                        if self.swa.apply_swa():
-                            swa_path = os.path.join(self.output_dir, f"checkpoint-{best_step}-swa")
-                            if not os.path.exists(swa_path):
-                                os.makedirs(swa_path, exist_ok=True)
-                            
-                            # Copy base checkpoint first
-                            if os.path.exists(best_model_path):
-                                for item in os.listdir(best_model_path):
-                                    s = os.path.join(best_model_path, item)
-                                    d = os.path.join(swa_path, item)
-                                    if os.path.isdir(s):
-                                        shutil.copytree(s, d, dirs_exist_ok=True)
-                                    else:
-                                        shutil.copy2(s, d)
-                            
-                            # Save SWA weights
-                            import torch
-                            swa_state_dict = {}
-                            for name, param in model.named_parameters():
-                                if param.requires_grad and name in self.swa.swa_model:
-                                    swa_state_dict[name] = self.swa.swa_model[name].clone()
-                            
-                            if swa_state_dict:
-                                torch.save(swa_state_dict, os.path.join(swa_path, "swa_weights.pt"))
-                                best_model_path = swa_path
-                                model_type = "swa"
-                                print(f"Using SWA model with {self.swa.swa_n} averaged checkpoints", flush=True)
-                            
-                            # Restore original weights
-                            for name, param in model.named_parameters():
-                                if param.requires_grad and name in current_weights:
-                                    param.data = current_weights[name]
-                        else:
-                            # Restore original weights
-                            for name, param in model.named_parameters():
-                                if param.requires_grad and name in current_weights:
-                                    param.data = current_weights[name]
-                    except Exception as e:
-                        print(f"Failed to use SWA: {e}", flush=True)
-                        import traceback
-                        traceback.print_exc()
-            
-            if not os.path.exists(best_model_path):
-                best_model_path = os.path.join(self.output_dir, f"checkpoint-{best_step}")
-            
-            shutil.copytree(best_model_path, self.submission_dir)
+            shutil.copytree(
+                os.path.join(self.output_dir, f"checkpoint-{self.best_checkpoint_info['step']}"),
+                self.submission_dir
+            )
             self.update_best_checkpoint = False
-            
-            # Save metadata
+            # add a loss.txt file to the submission directory
             with open(os.path.join(self.submission_dir, "loss.txt"), "w") as f:
-                f.write(f"{best_step},{best_eval_loss},{model_type}")
-            
-            # Save detailed info
-            with open(os.path.join(self.submission_dir, "checkpoint_info.json"), "w") as f:
-                json.dump(self.best_checkpoint_info, f, indent=2)
+                f.write(f"{self.best_checkpoint_info['step']},{best_eval_loss}")
 
 
 class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
@@ -523,7 +292,7 @@ class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
 
 def check_remaining_time_less_than_minutes(end_time: str, minutes: int) -> bool: 
     end_time = datetime.datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
-    end_time = end_time.replace(tzinfo=timezone.utc)
+    end_time = end_time.replace(tzinfo=timezone.utc)  # Make end_time timezone-aware in UTC
     now = datetime.datetime.now(timezone.utc)
     time_diff = end_time - now
     result =  time_diff.total_seconds() < minutes * 60
@@ -542,6 +311,7 @@ class WhenToEvalHandler:
         self.max_steps = max_steps
 
     def __call__(self, global_step: int) -> dict:
+        
         if self.steps_per_epoch != -1 and global_step % self.steps_per_epoch == 0 and global_step > 1:
             return {"eval": True, "reason": "epoch"}
         
@@ -551,6 +321,7 @@ class WhenToEvalHandler:
         if self.save_before_remaining_time > 0 and not self.run_eval:
             if check_remaining_time_less_than_minutes(self.end_time, self.save_before_remaining_time):
                 print(f"***ALERT: The time is about to run out need to eval & save the model", flush=True)
+                # the eval time might be higher than the end_time, so we need to let the pod not stop by setting a flag for this
                 self.run_eval = True
                 return {"eval": True, "reason": "end_time"}
         
@@ -580,6 +351,7 @@ def resize_if_needed(model_name, model, token_nums):
 
 
 def init_wandb(train_request: Dict):
+    # set wandb_mode=offline; do not upload the data to wandb export WANDB_MODE=offline
     return True
     task_id = train_request["task_id"]
     expected_repo_name = train_request["expected_repo_name"]
